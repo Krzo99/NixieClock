@@ -1,3 +1,7 @@
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include "NixieLib.h"
+
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
@@ -5,130 +9,113 @@
 
 #define EnableNix D6
 #define Buzzer D1
+#define Button D0
 
 #define STASSID "DG57A-ext"
 #define STAPSK  "omrezje57a"
 
-#define TimeToCheckOnline 1000 //In min
+#define TimeToCheckOnline 600 //In min
 #define RetryConnectionTime 5000 //In ms
 
-struct ShiftRegister {
-  int SER;
-  int RCLK;
-  int SRCLK;
-};
 
-ShiftRegister HourReg = {D4, D2, D3};
-ShiftRegister MinReg = {D5, D8, D7};
+Clock Clock(EnableNix, Buzzer, Button);
 
-byte NumberCodes[] = {B0000, B0001, B0010, B0011, B0100, B0101, B0110, B0111, B1000, B1001};
-
+//WifiStuff
 unsigned int LastOnlineCheck = 0;
-unsigned int SecsAtNextMin = 1000;
+bool bFirstCheck = true;
+bool bServerRunning = false;
 
-int Minutes = 0;
-int Hours = 0;
-
-
+ESP8266WebServer server(80);
 
 void setup() {
   Serial.begin(115200);
 
   //Pins
-  pinMode(HourReg.SER, OUTPUT);
-  pinMode(HourReg.RCLK, OUTPUT);
-  pinMode(HourReg.SRCLK, OUTPUT);
-
-  pinMode(MinReg.SER, OUTPUT);
-  pinMode(MinReg.RCLK, OUTPUT);
-  pinMode(MinReg.SRCLK, OUTPUT);
-
-  pinMode(EnableNix, OUTPUT);
-  pinMode(Buzzer, OUTPUT);
-
-  SetHours(0);
-  SetMin(0);
-
+  Clock.Init();
+  
+  WiFi.mode(WIFI_STA);
   delay(1000);
 
-  WiFi.mode(WIFI_STA);
-  SetEnable(HIGH);
-
 }
 
-void SetEnable(bool En)
+void handleRoot()
 {
-  digitalWrite(EnableNix, En);
+  server.send_P(200, "text/html", "200");
 }
-
-void WriteLL(int Number, ShiftRegister Reg)
+void handleSetAlarm()
 {
-  if ((Number <= 99 and Number >= 0))
+  if (server.hasArg("time"))
   {
-    int Enica = Number % 10;
-    int Desetica = Number / 10;
-
-    byte EnicaByte = NumberCodes[Enica];
-    byte DeseticaByte = NumberCodes[Desetica];
-
-    //Desetice
-    for (int i = 0; i < 4; i++)
+    String GotData = server.arg("time");
+    if (GotData.length() == 5)
     {
-      digitalWrite(Reg.SER, DeseticaByte & B1000);
-      DeseticaByte <<= 1;
+      int H = GotData.substring(0,2).toInt();
+      int M = GotData.substring(3).toInt();   
 
-      digitalWrite(Reg.SRCLK, LOW);
-      digitalWrite(Reg.SRCLK, HIGH);
+      Clock.SetAlarm(H, M);
+      
+      server.send(200, "text/html",  "Success");
+      return;
     }
-
-
-    //Enice
-    for (int i = 0; i < 4; i++)
-    {
-      digitalWrite(Reg.SER, EnicaByte & B1000);
-      EnicaByte <<= 1;
-
-      digitalWrite(Reg.SRCLK, LOW);
-      digitalWrite(Reg.SRCLK, HIGH);
-    }
-
-    PushToReg(Reg);
   }
+  
+  server.send(200, "text/html",  "Failed");
 }
-void PushToReg(ShiftRegister Reg)
+void handleNotFound()
 {
-  digitalWrite(Reg.RCLK, LOW);
-  digitalWrite(Reg.RCLK, HIGH);
+  server.send_P(200, "text/html", "404");
 }
 
-void SetHours(int Hours)
+void handleResetAlarm()
 {
-  WriteLL(Hours, HourReg);
+  Clock.ResetAlarm();
+  server.send_P(200, "text/html", "Success");
 }
-void SetMin(int Mins)
+
+void handleCheckAlarm()
 {
-  WriteLL(Mins, MinReg);
+  Clock.BlinkAlarm();
+  server.send(200, "text/html", "Check Clock");
 }
 
 void loop() {
+
+  //Wifi stuff
   if (WiFi.status() != WL_CONNECTED)
   {
     ConnectToWifi();
+    bServerRunning = false;
   }
-  else if (millis() - LastOnlineCheck > TimeToCheckOnline)
+  else if (!bServerRunning)
+  {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      server.on("/", handleRoot);
+      server.on("/setAlarm", handleSetAlarm);
+      server.on("/resetAlarm", handleResetAlarm);
+      server.on("/checkAlarm", handleCheckAlarm);
+      server.onNotFound(handleNotFound);
+      server.begin();
+      Serial.println("");
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+      Serial.print("MAC address: ");
+      Serial.println(WiFi.macAddress());
+      if (MDNS.begin("esp8266")) {              // Start the mDNS responder for esp8266.local
+        Serial.println("mDNS responder started");
+      } else {
+        Serial.println("Error setting up MDNS responder!");
+      }
+      bServerRunning = true;
+    }
+  }
+  else if (millis() - LastOnlineCheck > TimeToCheckOnline * 1000 * 60 || bFirstCheck)
   {
     CheckTimeOnline();
   }
 
-  if (millis() / 1000 >= SecsAtNextMin)
-  {
-    SecsAtNextMin = millis() / 1000 + 60;
-
-    Minutes == 59 ? Minutes = 0, Hours++ : Minutes++;
-    SetHours(Hours);
-    SetMin(Minutes);
-
-  }
+  Clock.Loop();
+  server.handleClient();
 }
 
 void ConnectToWifi()
@@ -139,9 +126,7 @@ void ConnectToWifi()
     LastAtempt = millis();
     WiFi.begin(STASSID, STAPSK);
   }
-
 }
-
 
 void CheckTimeOnline()
 {
@@ -163,23 +148,11 @@ void CheckTimeOnline()
         DeserializationError er = deserializeJson(JsonDoc, Jsonbuff);
         int tajm = JsonDoc["unixtime"];
 
-        SetTime(tajm);
+        Clock.SetTime(tajm);
+        LastOnlineCheck = millis();
+        bFirstCheck = false;
       }
     }
     http.end();
   }
-}
-
-void SetTime(int unix)
-{
-  Minutes = unix / 60 % 60;
-  Hours = unix / 60 / 60 % 24;
-
-  SecsAtNextMin = millis() / 1000 + 60 - unix % 60;
-
-  Hours != 23 ? Hours++ : Hours = 0;
-
-  SetHours(Hours);
-  SetMin(Minutes);
-
 }
